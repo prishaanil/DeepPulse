@@ -20,13 +20,19 @@ import argparse
 
 parser = argparse.ArgumentParser()
 # Dataset and dataloader
-parser.add_argument('--dset_pretrain', type=str, default='etth1', help='dataset name')
+parser = argparse.ArgumentParser()
+# Dataset and dataloader
+parser.add_argument('--dset_pretrain', type=str, default='PTB-XL', help='dataset name')
 parser.add_argument('--context_points', type=int, default=512, help='sequence length')
 parser.add_argument('--target_points', type=int, default=96, help='forecast horizon')
 parser.add_argument('--batch_size', type=int, default=64, help='batch size')
 parser.add_argument('--num_workers', type=int, default=0, help='number of workers for DataLoader')
 parser.add_argument('--scaler', type=str, default='standard', help='scale the input data')
 parser.add_argument('--features', type=str, default='M', help='for multivariate model or univariate model')
+# Dataset paths
+parser.add_argument('--root_path', type=str, default='/home/paz3b/DeepPulse/src/data/datasets/physionet.org/files/ptb-xl/1.0.3/', help='Root path to the dataset')
+parser.add_argument('--data_path', type=str, default='ptbxl_database_cleaned.csv', help='Path to the dataset file')
+parser.add_argument('--target', type=str, default='filename_hr', help='Target column in the dataset')
 # Patch
 parser.add_argument('--patch_len', type=int, default=12, help='patch length')
 parser.add_argument('--stride', type=int, default=12, help='stride between patch')
@@ -64,76 +70,119 @@ def get_model(c_in, args):
     """
     c_in: number of variables
     """
-    # get number of patches
-    num_patch = (max(args.context_points, args.patch_len)-args.patch_len) // args.stride + 1    
-    print('number of patches:', num_patch)
-    
-    # get model
+    # Force num_patch to a specific value
+    num_patch = 416  # Set this to the desired value (e.g., 42 or 416)
+    print(f"[INFO] Forcing number of patches to: {num_patch}")
+
+    # Initialize the model
     model = PatchTST(c_in=c_in,
-                target_dim=args.target_points,
-                patch_len=args.patch_len,
-                stride=args.stride,
-                num_patch=num_patch,
-                n_layers=args.n_layers,
-                n_heads=args.n_heads,
-                d_model=args.d_model,
-                shared_embedding=True,
-                d_ff=args.d_ff,                        
-                dropout=args.dropout,
-                head_dropout=args.head_dropout,
-                act='relu',
-                head_type='pretrain',
-                res_attention=False
-                )        
-    # print out the model size
+                     target_dim=args.target_points,
+                     patch_len=args.patch_len,
+                     stride=args.stride,
+                     num_patch=num_patch,
+                     n_layers=args.n_layers,
+                     n_heads=args.n_heads,
+                     d_model=args.d_model,
+                     shared_embedding=True,
+                     d_ff=args.d_ff,
+                     dropout=args.dropout,
+                     head_dropout=args.head_dropout,
+                     act='relu',
+                     head_type='pretrain',
+                     res_attention=False)
     print('number of model params', sum(p.numel() for p in model.parameters() if p.requires_grad))
     return model
+    
+def load_checkpoint(model, checkpoint_path):
+    """
+    Load a checkpoint and handle mismatched parameters.
+    """
+    checkpoint = torch.load(checkpoint_path)
+    state_dict = checkpoint["state_dict"]
 
+    # Debug: Print shapes of parameters in the checkpoint and the model
+    print("[DEBUG] Checking parameter shapes:")
+    for name, param in state_dict.items():
+        if name in model.state_dict():
+            model_param = model.state_dict()[name]
+            if param.shape != model_param.shape:
+                print(f"[DEBUG] Shape mismatch for {name}: checkpoint {param.shape}, model {model_param.shape}")
+        else:
+            print(f"[DEBUG] {name} not found in model.")
+
+    # Remove mismatched parameters
+    for name in list(state_dict.keys()):
+        if name in model.state_dict() and state_dict[name].shape != model.state_dict()[name].shape:
+            print(f"[INFO] Ignoring {name} due to shape mismatch.")
+            del state_dict[name]
+
+    # Load the state dictionary into the model
+    model.load_state_dict(state_dict, strict=False)
+    print("[INFO] Checkpoint loaded successfully.")
+    return model
+
+def get_checkpoint_num_patch(checkpoint_path):
+    checkpoint = torch.load(checkpoint_path)
+    if "W_pos" in checkpoint["state_dict"]:
+        checkpoint_num_patch = checkpoint["state_dict"]["W_pos"].shape[1]
+        print(f"[INFO] Number of patches in checkpoint: {checkpoint_num_patch}")
+        return checkpoint_num_patch
+    else:
+        raise ValueError("W_pos not found in checkpoint.")
 
 def find_lr():
-    # get dataloader
-    dls = get_dls(args)    
-    model = get_model(dls.vars, args)
-    # get loss
+    # Get DataLoader and metadata
+    train_loader, num_channels, seq_len = get_dls(args)  # Ensure get_dls returns num_channels
+
+    # Initialize the model
+    model = get_model(num_channels, args)  # Pass num_channels to get_model
+
+    # Define the loss function
     loss_func = torch.nn.MSELoss(reduction='mean')
-    # get callbacks
-    cbs = [RevInCB(dls.vars, denorm=False)] if args.revin else []
-    cbs += [PatchMaskCB(patch_len=args.patch_len, stride=args.stride, mask_ratio=args.mask_ratio)]
-        
-    # define learner
-    learn = Learner(dls, model, 
-                        loss_func, 
-                        lr=args.lr, 
-                        cbs=cbs,
-                        )                        
-    # fit the data to the model
+
+    # Define callbacks
+    cbs = [RevInCB(num_channels, denorm=False)] if args.revin else []
+    cbs += [PatchMaskCB(patch_len=args.patch_len, stride=args.stride, d_model=args.d_model, mask_ratio=args.mask_ratio)]
+
+    # Define the learner
+    learn = Learner(train_loader, model, loss_func, lr=args.lr, cbs=cbs)
+
+    # Find the learning rate
     suggested_lr = learn.lr_finder()
-    print('suggested_lr', suggested_lr)
+    print('Suggested Learning Rate:', suggested_lr)
     return suggested_lr
 
 
 def pretrain_func(lr=args.lr):
-    # get dataloader
-    dls = get_dls(args)
-    # get model     
-    model = get_model(dls.vars, args)
-    # get loss
+    # Skip checkpoint logic
+    args.context_points = 5000
+    args.patch_len = 12
+    args.stride = 12
+    print(f"[INFO] Updated args: context_points={args.context_points}, patch_len={args.patch_len}, stride={args.stride}")
+
+    # Get DataLoader and metadata
+    dls, num_channels, seq_len = get_dls(args)
+
+    # Set the vars attribute for compatibility
+    dls.vars = num_channels
+
+    # Initialize the model
+    model = get_model(num_channels, args)
+
+    # Define the loss function
     loss_func = torch.nn.MSELoss(reduction='mean')
-    # get callbacks
-    cbs = [RevInCB(dls.vars, denorm=False)] if args.revin else []
+
+    # Define callbacks
+    cbs = [RevInCB(dls.vars, denorm=False)] if args.revin else []  # Use dls.vars here
     cbs += [
-         PatchMaskCB(patch_len=args.patch_len, stride=args.stride, mask_ratio=args.mask_ratio),
-         SaveModelCB(monitor='valid_loss', fname=args.save_pretrained_model,                       
-                        path=args.save_path)
-        ]
-    # define learner
-    learn = Learner(dls, model, 
-                        loss_func, 
-                        lr=lr, 
-                        cbs=cbs,
-                        #metrics=[mse]
-                        )                        
-    # fit the data to the model
+        PatchMaskCB(patch_len=args.patch_len, stride=args.stride, d_model=args.d_model, mask_ratio=args.mask_ratio),
+        SaveModelCB(monitor='valid_loss', fname=args.save_pretrained_model, path=args.save_path)
+    ]
+
+    # Define the learner
+    learn = Learner(dls, model, loss_func, lr=lr, cbs=cbs)
+
+    # Fit the data to the model
     learn.fit_one_cycle(n_epochs=args.n_epochs_pretrain, lr_max=lr)
 
     train_loss = learn.recorder['train_loss']

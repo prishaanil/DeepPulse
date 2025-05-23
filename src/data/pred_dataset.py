@@ -5,7 +5,9 @@ import os
 import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
-from sklearn.preprocessing import OneHotEncoder
+import wfdb
+import ast
+from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
 from src.data.timefeatures import time_features
 import warnings
@@ -49,6 +51,7 @@ class Dataset_ETT_hour(Dataset):
         self.scaler = StandardScaler()
         df_raw = pd.read_csv(os.path.join(self.root_path,
                                           self.data_path))
+        print("df_raw columns:", df_raw.columns)
 
         border1s = [0, 12 * 30 * 24 - self.seq_len, 12 * 30 * 24 + 4 * 30 * 24 - self.seq_len]
         border2s = [12 * 30 * 24, 12 * 30 * 24 + 4 * 30 * 24, 12 * 30 * 24 + 8 * 30 * 24]
@@ -141,6 +144,7 @@ class Dataset_ETT_minute(Dataset):
         self.scaler = StandardScaler()
         df_raw = pd.read_csv(os.path.join(self.root_path,
                                           self.data_path))
+        print("df_raw columns:", df_raw.columns)
 
         border1s = [0, 12 * 30 * 24 * 4 - self.seq_len, 12 * 30 * 24 * 4 + 4 * 30 * 24 * 4 - self.seq_len]
         border2s = [12 * 30 * 24 * 4, 12 * 30 * 24 * 4 + 4 * 30 * 24 * 4, 12 * 30 * 24 * 4 + 8 * 30 * 24 * 4]
@@ -200,124 +204,143 @@ class Dataset_ETT_minute(Dataset):
 
 class Dataset_PTB_XL(Dataset):
     def __init__(self, root_path, split='train', size=None,
-                 features='S', data_path='ptbxl_database_cleaned.csv',
-                 target='scp_codes', train_split=0.7, test_split=0.2):
-        """
-        Dataset class for handling PTB-XL time-series data for ECG diagnosis prediction.
-        """
-        # size [seq_len, label_len, pred_len]
-        if size is None:
-            self.seq_len = 1000  # Default sequence length
-            self.label_len = 0   # No label sequence
-            self.pred_len = 0    # No prediction sequence
-        else:
-            self.seq_len = size[0]
-            self.label_len = size[1]
-            self.pred_len = size[2]
-
-        # Initialize parameters
+                 data_path='ptbxl_database_cleaned.csv', target='scp_codes',
+                 train_split=0.7, test_split=0.2, scale=True):
+        print(">>> [PTB_XL] __init__ started")
         assert split in ['train', 'test', 'val']
         type_map = {'train': 0, 'val': 1, 'test': 2}
         self.set_type = type_map[split]
 
-        self.features = features
         self.target = target
         self.train_split = train_split
         self.test_split = test_split
+        self.scale = scale
 
         self.root_path = root_path
         self.data_path = data_path
-        self.superclass_map = {
-            'NORM': 0,  # Normal ECG
-            'MI': 1,    # Myocardial Infarction
-            'STTC': 2,  # ST/T Change
-            'CD': 3,    # Conduction Disturbance
-            'HYP': 4    # Hypertrophy
-        }
-        self.__read_data__()
+        self.min_val = None
+        self.max_val = None
+
+        print(">>> [PTB_XL] Reading CSV...")
+        df_all = pd.read_csv(os.path.join(self.root_path, self.data_path))
+        print(">>> [PTB_XL] CSV loaded. Shape:", df_all.shape)
+
+        # 1. Find all unique codes
+        print(">>> [PTB_XL] Finding all unique codes...")
+        all_codes = set()
+        for codestr in df_all['scp_codes']:
+            d = ast.literal_eval(codestr)
+            all_codes.update(d.keys())
+        all_codes = sorted(list(all_codes))  # consistent order
+        print(">>> [PTB_XL] Found", len(all_codes), "unique codes.")
+
+        # 2. Count support for each code
+        print(">>> [PTB_XL] Counting support for each code...")
+        code_counts = {code: 0 for code in all_codes}
+        for codestr in df_all['scp_codes']:
+            d = ast.literal_eval(codestr)
+            for code in d.keys():
+                code_counts[code] += 1
+        print(">>> [PTB_XL] Support counted.")
+
+        min_support = 5  # or your chosen threshold
+        rare_codes = [code for code, count in code_counts.items() if count <= min_support]
+        common_codes = [code for code in all_codes if code not in rare_codes]
+        print(">>> [PTB_XL] Rare codes being removed:", rare_codes)
+        print(">>> [PTB_XL] Number of common codes:", len(common_codes))
+        self.all_codes = common_codes  # Only keep common codes
+
+        # 3. Build label matrix using only common codes
+        print(">>> [PTB_XL] Building label matrix...")
+        label_matrix = []
+        for codestr in df_all['scp_codes']:
+            d = ast.literal_eval(codestr)
+            label_matrix.append([d.get(code, 0.0) for code in self.all_codes])
+        label_matrix = np.array(label_matrix)
+        print(">>> [PTB_XL] Label matrix shape:", label_matrix.shape)
+
+        # 4. Stratified split
+        print(">>> [PTB_XL] Performing stratified split...")
+        mskf = MultilabelStratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        train_idx, val_idx = next(mskf.split(np.zeros(len(label_matrix)), label_matrix))
+        print(">>> [PTB_XL] Stratified split done. Train size:", len(train_idx), "Val size:", len(val_idx))
+
+        if self.set_type == 0:  # train
+            self.data = df_all.iloc[train_idx].reset_index(drop=True)
+            print(">>> [PTB_XL] Assigned train data. Shape:", self.data.shape)
+        elif self.set_type == 1:  # val
+            self.data = df_all.iloc[val_idx].reset_index(drop=True)
+            print(">>> [PTB_XL] Assigned val data. Shape:", self.data.shape)
+        else:  # test
+            self.data = df_all.iloc[val_idx].reset_index(drop=True)  # or your test logic
+            print(">>> [PTB_XL] Assigned test data. Shape:", self.data.shape)
+
+        print(">>> [PTB_XL] __init__ complete")
 
     def __read_data__(self):
-        """
-        Reads and preprocesses the PTB-XL dataset.
-        """
-        # Load the cleaned dataset
         df_raw = pd.read_csv(os.path.join(self.root_path, self.data_path))
+        print("df_raw columns:", df_raw.columns)
+        # Select only the id and target columns
+        df_raw = df_raw[['ecg_id', 'filename_hr', self.target]]
 
-        # Handle missing values in the 'device' column
-        df_raw['device'] = df_raw['device'].fillna('Unknown')
+        # Drop duplicate columns by name (keep the first occurrence)
+        df_raw = df_raw.loc[:, ~df_raw.columns.duplicated()]
 
-        # One-hot encode the device column
-        self.device_encoder = OneHotEncoder(sparse=False, handle_unknown='ignore')
-        device_encoded = self.device_encoder.fit_transform(df_raw[['device']])
-
-        # Convert the one-hot-encoded array to a DataFrame
-        device_encoded_df = pd.DataFrame(
-            device_encoded,
-            columns=[f"device_{cat}" for cat in self.device_encoder.categories_[0]]
-        )
-
-        # Reset the index of the one-hot-encoded DataFrame to match the original DataFrame
-        device_encoded_df.index = df_raw.index
-
-        # Map scp_codes to superclasses
-        df_raw['superclass'] = df_raw[self.target].apply(self.__map_superclass)
-
-        # Select relevant features (excluding the original 'device' column)
-        feature_columns = ['age', 'sex', 'height', 'weight', 'heart_axis',
-                        'baseline_drift', 'burst_noise', 'electrodes_problems',
-                        'extra_beats', 'pacemaker', 'infarction_stadium1', 'infarction_stadium2']
-        df_features = df_raw[feature_columns].fillna(0)  # Replace NaN with 0
-
-        # Concatenate the one-hot-encoded device columns with the features
-        df_features = pd.concat([df_features, device_encoded_df], axis=1)
-
-        # Debugging: Print feature columns and sample data
-        print("Feature Columns:", df_features.columns)
-        print("Sample Features:", df_features.head())
-
-        # Split data into train, validation, and test
+        # Now continue as before
         num_train = int(len(df_raw) * self.train_split)
         num_test = int(len(df_raw) * self.test_split)
         num_vali = len(df_raw) - num_train - num_test
-        border1s = [0, num_train - self.seq_len, len(df_raw) - num_test - self.seq_len]
+        border1s = [0, num_train, num_train + num_vali]
         border2s = [num_train, num_train + num_vali, len(df_raw)]
         border1 = border1s[self.set_type]
         border2 = border2s[self.set_type]
+        self.data = df_raw.iloc[border1:border2].reset_index(drop=True)
 
-        # Extract the data for the current split
-        self.data_x = df_features.values[border1:border2]
-        self.data_y = df_raw['superclass'].values[border1:border2]
+        # No need for further duplicate checks!
+        self.data = self.data[self.data['filename_hr'].astype(str).str.startswith('records500/')].reset_index(drop=True)
+        self.data = self.data[self.data['filename_hr'] != 'filename_hr'].reset_index(drop=True)
+        print("First 5 filename_hr values:", self.data['filename_hr'].head())
 
-    def __map_superclass(self, scp_codes):
-        """
-        Maps the scp_codes to one of the 5 superclasses.
-        """
-        scp_dict = eval(scp_codes)  # Convert string representation of dict to actual dict
-        for key in scp_dict.keys():
-            if key in self.superclass_map:
-                return self.superclass_map[key]
-        return -1  # Default to -1 if no superclass is found
+        # Scale the time-series data if scaling is enabled
+        if self.scale:
+            all_time_series = []
+            for filename_hr in self.data['filename_hr']:
+                file_path = os.path.join(self.root_path, filename_hr)
+                signals, _ = wfdb.rdsamp(file_path)
+                all_time_series.append(signals)
+            if self.set_type == 0:
+                numeric_data = np.vstack(all_time_series)
+                self.min_val = numeric_data.min(axis=0)
+                self.max_val = numeric_data.max(axis=0)
 
     def __getitem__(self, index):
-        """
-        Retrieves a single sample from the dataset.
-        """
-        seq_x = self.data_x[index]
-        seq_y = self.data_y[index]
+        ecg_id = self.data.iloc[index]['ecg_id']
+        filename_hr = self.data.iloc[index]['filename_hr']
+        codestr = self.data.iloc[index][self.target]
 
-        return torch.tensor(seq_x, dtype=torch.float32), torch.tensor(seq_y, dtype=torch.long)
+        # Load the time-series data from the file
+        file_path = os.path.join(self.root_path, filename_hr)
+        signals, _ = wfdb.rdsamp(file_path)
+
+        # Scale the time-series data if scaling is enabled
+        if self.scale and self.min_val is not None and self.max_val is not None:
+            signals = (signals - self.min_val) / (self.max_val - self.min_val)
+        signals = np.array(signals)
+
+        # --- NEW: Parse scp_codes into a multi-label vector ---
+        code_dict = ast.literal_eval(codestr)
+
+        target_vec = np.array([code_dict.get(code, 0.0) for code in self.all_codes], dtype=np.float32)
+
+        return torch.tensor(signals, dtype=torch.float32), torch.tensor(target_vec, dtype=torch.float32)
 
     def __len__(self):
-        """
-        Returns the number of samples in the dataset.
-        """
-        return len(self.data_x)
-    
-    def inverse_transform(self, data):
-        """
-        Applies inverse scaling to the data.
-        """
-        return self.scaler.inverse_transform(data)
+        return len(self.data)
+
+    def inverse_transform(self, scaled_data):
+        if not self.scale or self.min_val is None or self.max_val is None:
+            raise ValueError("Scaling is not enabled or min/max values are not set.")
+        return scaled_data * (self.max_val - self.min_val) + self.min_val
 
 class Dataset_Custom(Dataset):
     def __init__(self, root_path, split='train', size=None,
@@ -361,6 +384,7 @@ class Dataset_Custom(Dataset):
         self.scaler = StandardScaler()
         df_raw = pd.read_csv(os.path.join(self.root_path,
                                           self.data_path))
+        print("df_raw columns:", df_raw.columns)
         if self.features == 'M' or self.features == 'MS':
             cols_data = df_raw.select_dtypes(include=[np.number]).columns
             df_data = df_raw[cols_data]
@@ -464,6 +488,7 @@ class Dataset_Pred(Dataset):
         self.scaler = StandardScaler()
         df_raw = pd.read_csv(os.path.join(self.root_path,
                                           self.data_path))
+        print("df_raw columns:", df_raw.columns)
         '''
         df_raw.columns: ['date', ...(other features), target feature]
         '''

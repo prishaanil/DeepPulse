@@ -29,7 +29,7 @@ class PatchCB(Callback):
 
 
 class PatchMaskCB(Callback):
-    def __init__(self, patch_len, stride, mask_ratio,
+    def __init__(self, patch_len, stride, mask_ratio, d_model,
                         mask_when_pred:bool=False):
         """
         Callback used to perform the pretext task of reconstruct the original data after a binary mask has been applied.
@@ -40,7 +40,8 @@ class PatchMaskCB(Callback):
         """
         self.patch_len = patch_len
         self.stride = stride
-        self.mask_ratio = mask_ratio        
+        self.mask_ratio = mask_ratio
+        self.linear = nn.Linear(d_model, patch_len)        
 
     def before_fit(self):
         # overwrite the predefined loss function
@@ -61,12 +62,21 @@ class PatchMaskCB(Callback):
  
     def _loss(self, preds, target):        
         """
-        preds:   [bs x num_patch x n_vars x patch_len]
-        targets: [bs x num_patch x n_vars x patch_len] 
+        preds:   [bs x n_vars x d_model x num_patch] (from model output)
+        targets: [bs x num_patch x n_vars x patch_len] (from patch_masking)
         """
+        # Align preds to match the shape of target
+        preds = preds.permute(0, 3, 1, 2)  # [bs x num_patch x n_vars x d_model]
+
+        # Ensure d_model matches patch_len
+        if preds.shape[-1] != target.shape[-1]:
+            self.linear = self.linear.to(preds.device)  # Move linear layer to the same device as preds
+            preds = self.linear(preds)  # Apply a linear layer to map d_model -> patch_len
+
+        # Compute the loss
         loss = (preds - target) ** 2
-        loss = loss.mean(dim=-1)
-        loss = (loss * self.mask).sum() / self.mask.sum()
+        loss = loss.mean(dim=-1)  # Average over patch_len
+        loss = (loss * self.mask).sum() / self.mask.sum()  # Masked loss
         return loss
 
 
@@ -75,12 +85,14 @@ def create_patch(xb, patch_len, stride):
     xb: [bs x seq_len x n_vars]
     """
     seq_len = xb.shape[1]
-    num_patch = (max(seq_len, patch_len)-patch_len) // stride + 1
-    tgt_len = patch_len  + stride*(num_patch-1)
+    num_patch = (max(seq_len, patch_len) - patch_len) // stride + 1
+    print(f"Input xb shape: {xb.shape}, Number of patches: {num_patch}")
+    tgt_len = patch_len + stride * (num_patch - 1)
     s_begin = seq_len - tgt_len
-        
-    xb = xb[:, s_begin:, :]                                                    # xb: [bs x tgt_len x nvars]
-    xb = xb.unfold(dimension=1, size=patch_len, step=stride)                 # xb: [bs x num_patch x n_vars x patch_len]
+
+    xb = xb[:, s_begin:, :]  # xb: [bs x tgt_len x nvars]
+    xb = xb.unfold(dimension=1, size=patch_len, step=stride)  # xb: [bs x num_patch x n_vars x patch_len]
+    print(f"Output xb shape after unfolding: {xb.shape}")
     return xb, num_patch
 
 

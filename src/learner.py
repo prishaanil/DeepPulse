@@ -1,4 +1,3 @@
-
 from typing import List
 import torch
 from torch.optim import Adam
@@ -18,6 +17,7 @@ import numpy as np
 
 from sklearn.base import BaseEstimator
 from unittest.mock import patch
+import os
 
 
 class Learner(GetAttr):
@@ -377,13 +377,16 @@ class Learner(GetAttr):
         save_model(fname, self.model, getattr(self,'opt',None), **kwargs)
         return fname
 
-
     def load(self, fname, with_opt=False, device='cuda', strict=True, **kwargs):
         """
         load the model
         """
         if not torch.cuda.is_available():
             device = "cpu"
+        # Add this check:
+        if fname is None or not os.path.isfile(fname):
+            print(f"[WARNING] No saved model found at {fname}. Skipping model reload.")
+            return
         load_model(fname, self.model, self.opt, with_opt, device=device, strict=strict)
 
 
@@ -424,23 +427,63 @@ def save_model(path, model, opt, with_opt=True, pickle_protocol=2):
     torch.save(state, path, pickle_protocol=pickle_protocol)
 
 
-def load_model(path, model, opt=None, with_opt=False, device='cpu', strict=True):
-    " load the saved model "
+def load_model(path, model, opt=None, with_opt=False, device='cpu', strict=False):
+    """
+    Load a model checkpoint and handle mismatched parameters.
+    """
     state = torch.load(path, map_location=device)
-    if not opt: with_opt=False
-    model_state = state['model'] if with_opt else state
-    get_model(model).load_state_dict(model_state, strict=strict)
-    if with_opt: opt.load_state_dict(state['opt'])
-    model = model.to(device)
-      
 
-def join_path_file(file, path, ext=''):
-    "Return `path/file` if file is a string or a `Path`, file otherwise"
-    if not isinstance(file, (str, Path)): return file
-    if not isinstance(path, Path): path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
-    return path/f'{file}{ext}'
+    # Handle cases where the checkpoint does not have a 'model' key
+    if 'model' in state:
+        model_state = state['model']
+    else:
+        print("[WARNING] 'model' key not found in checkpoint. Assuming the checkpoint contains the state dictionary directly.")
+        model_state = state
 
+    # Resize or ignore mismatched parameters
+    mismatched_params = []
+    for name, param in model_state.items():
+        if name in model.state_dict():
+            model_param = model.state_dict()[name]
+            if param.shape != model_param.shape:
+                print(f"[INFO] Resizing or ignoring parameter: {name}")
+                if name == "head.linear.weight" or name == "head.linear.bias":
+                    print(f"[INFO] Ignoring parameter: {name}")
+                    mismatched_params.append(name)
+                elif len(param.shape) == len(model_param.shape):
+                    # Resize using slicing or padding
+                    if param.shape[0] > model_param.shape[0]:  # Truncate if too large
+                        model_state[name] = param[:model_param.shape[0]]
+                    elif param.shape[0] < model_param.shape[0]:  # Pad if too small
+                        if len(param.shape) == 1:  # Handle 1D tensors
+                            padding = (0, model_param.shape[0] - param.shape[0])
+                            model_state[name] = torch.nn.functional.pad(param, padding)
+                        else:  # Handle higher-dimensional tensors
+                            padding = (0, 0) * (len(param.shape) - 1) + (0, model_param.shape[0] - param.shape[0])
+                            model_state[name] = torch.nn.functional.pad(param, padding)
+                    else:
+                        mismatched_params.append(name)
+                else:
+                    # Ignore the parameter if dimensions don't match
+                    print(f"[INFO] Ignoring parameter due to incompatible dimensions: {name}")
+                    mismatched_params.append(name)
+        else:
+            print(f"[INFO] Ignoring parameter not found in model: {name}")
+            mismatched_params.append(name)
+
+    # Remove mismatched parameters
+    for name in mismatched_params:
+        del model_state[name]
+
+    # Debug: Print remaining mismatched parameters
+    for name, param in model_state.items():
+        if name in model.state_dict() and param.shape != model.state_dict()[name].shape:
+            print(f"[DEBUG] Remaining mismatch: {name}, checkpoint shape: {param.shape}, model shape: {model.state_dict()[name].shape}")
+
+    # Load the state dictionary
+    model.load_state_dict(model_state, strict=False)
+    print("[INFO] Checkpoint loaded successfully.")
+    return model
 
 def get_model(model):
     "Return the model maybe wrapped inside `model`."    
@@ -515,3 +558,7 @@ def get_layer_output(inp, model, layers=None, unwrap=False):
     out = orig_model(inp)    
     for h in h_list: h.remove()
     return activation
+
+def join_path_file(fname, path, ext='.pth'):
+    """Join directory, filename, and extension into a full path."""
+    return os.path.join(path, f"{fname}{ext}")

@@ -16,12 +16,14 @@ class RevIN(nn.Module):
             self._init_params()
 
     def forward(self, x, mode:str):
+        print(f"[DEBUG] RevIN input shape: {x.shape}, mode: {mode}")
         if mode == 'norm':
             self._get_statistics(x)
             x = self._normalize(x)
         elif mode == 'denorm':
             x = self._denormalize(x)
         else: raise NotImplementedError
+        print(f"[DEBUG] RevIN output shape: {x.shape}")
         return x
 
     def _init_params(self):
@@ -35,17 +37,24 @@ class RevIN(nn.Module):
         self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
 
     def _normalize(self, x):
-        x = x - self.mean
-        x = x / self.stdev
-        if self.affine:
-            x = x * self.affine_weight
-            x = x + self.affine_bias
+        self.mean = x.mean(dim=1, keepdim=True)
+        self.stdev = x.std(dim=1, keepdim=True)
+        x = (x - self.mean) / (self.stdev + 1e-5)
         return x
 
     def _denormalize(self, x):
-        if self.affine:
-            x = x - self.affine_bias
-            x = x / (self.affine_weight + self.eps*self.eps)
-        x = x * self.stdev
-        x = x + self.mean
+        print(f"[DEBUG] _denormalize input shape: {x.shape}")
+        print(f"[DEBUG] self.stdev shape: {self.stdev.shape}")
+        print(f"[DEBUG] self.mean shape: {self.mean.shape}")
+
+        # Handle additional dimensions (e.g., patches)
+        if x.shape[-1] != self.stdev.shape[-1]:
+            # Reshape or broadcast self.stdev and self.mean to match x
+            stdev = self.stdev.expand(x.size(0), x.size(1), self.stdev.size(-1))
+            mean = self.mean.expand(x.size(0), x.size(1), self.mean.size(-1))
+        else:
+            stdev = self.stdev
+            mean = self.mean
+
+        x = x * stdev + mean
         return x

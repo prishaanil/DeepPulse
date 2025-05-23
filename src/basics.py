@@ -1,4 +1,3 @@
-
 import torch
 
 import collections
@@ -43,10 +42,15 @@ def get_device(use_cuda=True, device_id=None, usage=5):
     return torch.device(torch.cuda.current_device()) if use_cuda else torch.device('cpu')
 
 
-def set_device(usage=5):    
-    "set the device that has usage < default usage  "
-    device_ids = get_available_cuda(usage=usage)
-    torch.cuda.set_device(device_ids[0])   # get the first available device
+def set_device(usage=5):
+    if torch.cuda.is_available():
+        print("CUDA is available. Setting device 0.")
+        torch.cuda.set_device(0)
+    else:
+        print("Using CPU only.")
+    return
+
+    # else do nothing (CPU)
 
 
 def default_device(use_cuda=True):
@@ -57,12 +61,9 @@ def default_device(use_cuda=True):
 
 
 def get_available_cuda(usage=10):
-    if not torch.cuda.is_available(): return
-    # collect available cuda devices, only collect devices that has less that 'usage' percent 
-    device_ids = []
-    for device in range(torch.cuda.device_count()):
-        if torch.cuda.utilization(device) < usage: device_ids.append(device)
-    return device_ids
+    if not torch.cuda.is_available():
+        return []
+    return [0]  # Always use device 0 for simplicity
 
 
 

@@ -78,7 +78,7 @@ def get_model(c_in, args):
                 dropout=args.dropout,
                 head_dropout=args.head_dropout,
                 act='relu',
-                head_type='prediction',
+                head_type='classification',
                 res_attention=False
                 )    
     return model
